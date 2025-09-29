@@ -86,8 +86,11 @@ def make_categorical(series: pd.Series, mode: str, bins: int, precision: int = 2
 
 
 # 追加: 処理人口の簡易グループ分け
-POP_BIN_EDGES = [0, 5000, 50000, 200000, 500000, float("inf")]
-POP_BIN_LABELS = ["〜5千人", "5千〜5万人", "5万〜20万人", "20万〜50万人", "50万人〜"]
+POP_PRESETS = {
+	"3区分（小/中/大）": ([0, 10000, 100000, float("inf")], ["〜1万人", "1万〜10万人", "10万人〜"]),
+	"5区分（細かめ）": ([0, 5000, 50000, 200000, 500000, float("inf")], ["〜5千人", "5千〜5万人", "5万〜20万人", "20万〜50万人", "50万人〜"]),
+	"7区分（詳細）": ([0, 3000, 10000, 30000, 100000, 300000, 500000, float("inf")], ["〜3千", "3千〜1万", "1万〜3万", "3万〜10万", "10万〜30万", "30万〜50万", "50万〜"]),
+}
 
 def to_number_series(s: pd.Series) -> pd.Series:
 	# カンマ・全角スペース等の除去して数値化
@@ -101,9 +104,9 @@ def to_number_series(s: pd.Series) -> pd.Series:
 	)
 
 @st.cache_data(show_spinner=False)
-def simple_population_group(series_like: pd.Series) -> pd.Series:
+def simple_population_group(series_like: pd.Series, edges: list[float], labels: list[str]) -> pd.Series:
 	values = to_number_series(series_like)
-	cats = pd.cut(values, bins=POP_BIN_EDGES, labels=POP_BIN_LABELS, include_lowest=True, right=False)
+	cats = pd.cut(values, bins=edges, labels=labels, include_lowest=True, right=False)
 	return cats.astype(str)
 
 
@@ -122,7 +125,10 @@ with st.sidebar:
 			st.info("コードの読み込みに失敗しました。")
 	st.markdown("—")
 	st.subheader("簡易モード")
-	use_simple_pop = st.toggle("処理人口を少数グループにまとめる", value=False, help="『処理人口』と名のつく列を自動検出し、固定ビンで5区分にまとめます")
+	use_simple_pop = st.toggle("『処理人口』をグループ化", value=False, help="処理人口系の列を固定ビンで少数カテゴリ化")
+	pop_col_hint = st.text_input("対象列ヒント（例: 処理人口（人）事業計画（直近））", value="処理人口（人）事業計画（直近）")
+	preset_name = st.selectbox("区分プリセット", list(POP_PRESETS.keys()), index=1)
+	custom_edges = st.text_input("カスタム閾値（カンマ区切り, 例: 0,10000,50000,100000,inf）", value="")
 
 if not uploaded:
 	st.info("ファイルをサイドバーからアップロードしてください。")
@@ -143,26 +149,35 @@ with st.expander("データの先頭 (50行)"):
 # 列選択とカテゴリ化設定
 col_config_1, col_config_2, misc_cfg = st.columns([1.2, 1.2, 0.8])
 
-# 自動検出: 処理人口っぽい列
-candidate_pop_cols = [c for c in df.columns if "処理人口" in str(c)]
-default_x_index = 0
-if candidate_pop_cols:
-	try:
-		default_x_index = df.columns.get_loc(candidate_pop_cols[0])
-	except Exception:
-		default_x_index = 0
+# 自動検出: 処理人口（人）事業計画（直近）を優先
+candidate_pop_cols = [c for c in df.columns if isinstance(c, str) and "処理人口" in c]
+priority_col = next((c for c in candidate_pop_cols if "事業計画" in c and "直近" in c), None)
+if priority_col is None and candidate_pop_cols:
+	priority_col = candidate_pop_cols[0]
+
+default_x_index = df.columns.get_loc(priority_col) if priority_col in df.columns if priority_col else 0
 
 with col_config_1:
 	st.subheader("1つ目のカテゴリ (X)")
 	col_x = st.selectbox("列を選択", df.columns, index=default_x_index, key="col_x")
-	if use_simple_pop and ("処理人口" in str(col_x)):
-		st.caption("簡易グループ: 〜5千 / 5千〜5万 / 5万〜20万 / 20万〜50万 / 50万〜")
-		mode_x = "simple_population"
-		bins_x = 5
-		# 先にカテゴリ化（固定ビン）
-		s_x = simple_population_group(df[col_x])
+	# 簡易モード: 対象列判定（ヒント文字 or 自動判定）
+	is_target_population = use_simple_pop and ((pop_col_hint and pop_col_hint in str(col_x)) or ("処理人口" in str(col_x)))
+	if is_target_population:
+		# プリセット/カスタムの閾値決定
+		edges, labels = POP_PRESETS[preset_name]
+		if custom_edges.strip():
+			try:
+				parts = [p.strip() for p in custom_edges.split(",") if p.strip()]
+				edges = [float("inf") if p.lower() == "inf" else float(p) for p in parts]
+				labels = [f"{int(edges[i]) if edges[i] != float('inf') else '∞'}〜{int(edges[i+1]) if edges[i+1] != float('inf') else '∞'}" for i in range(len(edges)-1)]
+			except Exception:
+				pass
+		st.caption(f"対象: {str(col_x)}  | 区分: {preset_name}")
+		s_x = simple_population_group(df[col_x], edges, labels)
 		cats_x_all = pd.Index(s_x.dropna().unique()).astype(str).tolist()
 		selected_cats_x = st.multiselect("人口グループを選択", cats_x_all, default=cats_x_all)
+		mode_x = "simple_population"
+		bins_x = len(labels)
 	else:
 		mode_x = st.selectbox("カテゴリ化方法", ["auto", "as_is", "qcut", "cut"], index=0, key="mode_x",
 			help="auto: 数値は分位数ビンに、文字列/日時はそのまま")
@@ -190,8 +205,8 @@ with misc_cfg:
 	sort_desc = st.toggle("集計を降順で表示", value=True)
 
 # 1つ目のカテゴリ選択でフィルタ
-if use_simple_pop and ("処理人口" in str(col_x)):
-	s_x = simple_population_group(df[col_x])
+if mode_x == "simple_population":
+	s_x = s_x  # 既に作成済み
 else:
 	s_x = make_categorical(df[col_x], "as_is" if not is_numeric(df[col_x]) else mode_x, bins_x)
 mask_x = s_x.isin(selected_cats_x) if selected_cats_x else pd.Series([True] * len(df), index=df.index)
@@ -230,7 +245,6 @@ with tab_ct:
 		fig = px.imshow(ct, text_auto=True, aspect="auto", color_continuous_scale="Greens")
 		st.plotly_chart(fig, use_container_width=True)
 	else:
-		# Yが数値のときはXカテゴリごとの集計
 		cx = s_x.loc[filtered_df2.index]
 		agg = filtered_df2.groupby(cx, dropna=False)[col_y].mean().reset_index().rename(columns={col_y: f"{col_y} (mean)"})
 		agg = agg.sort_values(agg.columns[-1], ascending=not sort_desc)
@@ -244,7 +258,6 @@ with tab_plot:
 			filtered_df2.assign(X=cx, Y=cy)
 			.groupby(["X", "Y"]).size().reset_index(name="count")
 		)
-		# 追加: 表示オプション（割合表示・上位N方法）
 		opt1, opt2, opt3 = st.columns([0.8, 0.8, 1])
 		with opt1:
 			show_share = st.toggle("割合(100%)で表示", value=True)
@@ -252,11 +265,9 @@ with tab_plot:
 			top_k = st.slider("方法の上位Nを表示", 3, 20, 8)
 		with opt3:
 			show_values = st.toggle("値ラベルを表示", value=False)
-		# 上位N方法の抽出（全体件数で）
 		method_order = df_plot.groupby("Y")["count"].sum().sort_values(ascending=False).index.tolist()
 		keep_methods = set(method_order[:top_k])
 		df_plot = df_plot[df_plot["Y"].isin(keep_methods)]
-		# 割合計算
 		if show_share:
 			df_tot = df_plot.groupby("X")["count"].sum().rename("total").reset_index()
 			df_plot = df_plot.merge(df_tot, on="X", how="left")
@@ -272,10 +283,8 @@ with tab_plot:
 				fig = px.bar(df_plot, x="X", y="count", color="Y", barmode="stack")
 			else:
 				fig = px.bar(df_plot, y="X", x="count", color="Y", barmode="stack", orientation="h")
-		# ラベル
 		if show_values:
 			fig.update_traces(texttemplate="%{y:.0%}" if show_share and bar_orientation=="vertical" else ("%{x:.0%}" if show_share else "%{y}" if bar_orientation=="vertical" else "%{x}"), textposition="inside")
-		# 凡例順序
 		fig.update_layout(legend_traceorder="normal")
 		st.plotly_chart(fig, use_container_width=True)
 	else:
@@ -288,11 +297,9 @@ with tab_plot:
 		st.plotly_chart(fig, use_container_width=True)
 
 with tab_stats:
-	# 要約統計
 	if not as_category_y and is_numeric(filtered_df2[col_y]):
 		st.subheader(f"{col_y} の要約統計 (絞り込み後)")
 		st.dataframe(filtered_df2[col_y].describe().to_frame().T, use_container_width=True)
-		# Xカテゴリごとの統計
 		cx = s_x.loc[filtered_df2.index]
 		agg = filtered_df2.groupby(cx, dropna=False)[col_y].agg(["count", "mean", "median", "min", "max"]).reset_index()
 		st.dataframe(agg, use_container_width=True)
@@ -307,5 +314,3 @@ st.download_button(
 	file_name="filtered.csv",
 	mime="text/csv",
 )
-
-
