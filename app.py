@@ -1,210 +1,271 @@
 import streamlit as st
 import pandas as pd
-import plotly.express as px
-import numpy as np
-from sklearn.cluster import KMeans
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics import silhouette_score
-import io
-from typing import List, Dict, Tuple, Optional
-import warnings
-warnings.filterwarnings("ignore")
+import altair as alt
+import chardet
+from io import StringIO, BytesIO
+from typing import List, Tuple
 
-st.set_page_config(
-    page_title="下水処理場データ分析システム",
-    page_icon="🏭",
-    layout="wide"
+st.set_page_config(page_title="下水処理場ガイド ビューア", layout="wide")
+st.title("下水処理場ガイド2025 ビューア（全列比較対応）")
+
+with st.sidebar:
+	st.header("データ読込")
+	uploaded = st.file_uploader("CSV/Excel を選択", type=["csv", "xlsx", "xlsm", "xls"])
+	encoding_hint = st.selectbox("エンコーディング推定/指定（CSV時）", ["auto", "utf-8", "cp932", "shift_jis", "utf-16"], index=0)
+	st.caption("ヘッダーが複数行相当のため、読み込み後に列名を自動整形します")
+
+@st.cache_data(show_spinner=False)
+def detect_encoding(sample_bytes: bytes) -> str:
+	result = chardet.detect(sample_bytes)
+	enc = result.get("encoding") or "utf-8"
+	if enc and enc.lower() in {"shift_jis", "sjis", "ms932"}:
+		return "cp932"
+	return enc
+
+@st.cache_data(show_spinner=True)
+def load_dataframe(file, encoding_hint: str) -> pd.DataFrame:
+	if file is None:
+		return pd.DataFrame()
+	name = (file.name or "").lower()
+	raw = file.read()
+	if name.endswith((".xlsx", ".xlsm", ".xls")):
+		return pd.read_excel(BytesIO(raw), header=None, engine="openpyxl")
+	encoding = detect_encoding(raw) if encoding_hint == "auto" else encoding_hint
+	text = raw.decode(encoding, errors="replace")
+	return pd.read_csv(StringIO(text), header=None)
+
+@st.cache_data(show_spinner=False)
+def clean_columns(df: pd.DataFrame) -> pd.DataFrame:
+	if df.empty:
+		return df
+	header_row_idx = 0
+	max_nonempty = -1
+	for i in range(min(10, len(df))):
+		nonempty = (df.iloc[i].astype(str).str.strip() != "").sum()
+		if nonempty > max_nonempty:
+			max_nonempty = nonempty
+			header_row_idx = i
+	new_cols = (
+		df.iloc[header_row_idx]
+		.astype(str)
+		.str.replace(r"\s+", " ", regex=True)
+		.str.replace("\n", " ")
+		.str.strip()
+		.where(lambda s: s != "", other="col")
+	)
+	counts = {}
+	fixed_cols = []
+	for c in new_cols:
+		base = c
+		k = base
+		n = 1
+		while k in counts:
+			n += 1
+			k = f"{base}_{n}"
+		counts[k] = 1
+		fixed_cols.append(k)
+	body = df.iloc[header_row_idx + 1 :].copy()
+	body.columns = fixed_cols
+	return body.reset_index(drop=True)
+
+@st.cache_data(show_spinner=False)
+def coerce_types(df: pd.DataFrame) -> pd.DataFrame:
+	if df.empty:
+		return df
+	out = df.copy()
+	for col in out.columns:
+		s = (
+			out[col]
+			.astype(str)
+			.str.replace(",", "", regex=False)
+			.str.replace("㎡", "", regex=False)
+			.str.replace("㎥/日最大", "", regex=False)
+		)
+		num = pd.to_numeric(s, errors="coerce")
+		if num.notna().sum() > 0 and (num.notna().mean() > 0.6):
+			out[col] = num
+	return out
+
+raw_df = load_dataframe(uploaded, encoding_hint)
+if raw_df.empty:
+	st.info("左のサイドバーから CSV または Excel ファイルを選択してください。")
+	st.stop()
+
+st.success(f"読み込み成功: 形状 {raw_df.shape}")
+
+df = coerce_types(clean_columns(raw_df))
+st.write("列数:", len(df.columns))
+
+with st.expander("先頭プレビュー", expanded=True):
+	st.dataframe(df.head(50), use_container_width=True)
+
+with st.sidebar:
+	st.header("フィルタ")
+	selected_cols = st.multiselect("絞込対象カラム", df.columns.tolist())
+	conditions = {}
+	for c in selected_cols:
+		series = df[c]
+		if pd.api.types.is_numeric_dtype(series):
+			vals = pd.to_numeric(series, errors="coerce")
+			if vals.notna().any():
+				min_v = float(vals.min(skipna=True))
+				max_v = float(vals.max(skipna=True))
+				left, right = st.slider(c, min_v, max_v, (min_v, max_v))
+				conditions[c] = ("range", (left, right))
+		else:
+			uniq = sorted(series.dropna().astype(str).unique().tolist())[:5000]
+			chosen = st.multiselect(c, uniq)
+			if chosen:
+				conditions[c] = ("in", chosen)
+
+mask = pd.Series([True] * len(df))
+for col, cond in conditions.items():
+	kind, val = cond
+	if kind == "in":
+		mask &= df[col].astype(str).isin(val)
+	else:
+		left, right = val
+		s = pd.to_numeric(df[col], errors="coerce")
+		mask &= s.ge(left) & s.le(right)
+
+fdf = df[mask].copy()
+
+search = st.text_input("全体検索（部分一致、大小文字区別なし）")
+if search:
+	pat = search.lower()
+	fdf = fdf[fdf.astype(str).apply(lambda row: pat in " ".join(map(str, row.values)).lower(), axis=1)]
+
+st.metric("ヒット件数", len(fdf))
+
+with st.sidebar:
+	st.header("並び替え")
+	sort_col = st.selectbox("ソート列", [None] + fdf.columns.tolist(), index=0)
+	ascending = st.toggle("昇順", value=True)
+	if sort_col:
+		fdf = fdf.sort_values(by=sort_col, ascending=ascending)
+
+# ========== 全列比較 ==========
+st.subheader("全列比較")
+compare_all = st.toggle("全列を比較対象にする", value=True, help="オフにすると下で列を選択できます")
+if compare_all:
+	compare_cols = list(fdf.columns)
+else:
+	compare_cols = st.multiselect("比較対象列を選ぶ（任意件数）", fdf.columns.tolist(), default=list(fdf.columns)[:10])
+
+num_cols_all = [c for c in compare_cols if pd.api.types.is_numeric_dtype(fdf[c])]
+cat_cols_all = [c for c in compare_cols if not pd.api.types.is_numeric_dtype(fdf[c])]
+
+ tabs = st.tabs(["相関ヒートマップ(数値)", "散布行列(数値)", "クロス集計(カテゴリ×カテゴリ)", "グループ統計(カテゴリ→数値)"])
+
+# 相関ヒートマップ
+with tabs[0]:
+	if len(num_cols_all) >= 2:
+		corr = fdf[num_cols_all].corr(numeric_only=True)
+		corr_melt = corr.reset_index().melt(id_vars=corr.index.name or "index")
+		corr_melt.columns = ["X", "Y", "相関"]
+		chart = alt.Chart(corr_melt).mark_rect().encode(
+			x=alt.X("X:O", sort=None),
+			y=alt.Y("Y:O", sort=None),
+			color=alt.Color("相関:Q", scale=alt.Scale(scheme="blueorange", domain=[-1, 1])),
+			tooltip=["X", "Y", alt.Tooltip("相関:Q", format=".3f")],
+		).properties(height=500)
+		st.altair_chart(chart, use_container_width=True)
+	else:
+		st.info("数値列が2列以上必要です")
+
+# 散布行列（多すぎると重いので最大10列を推奨）
+with tabs[1]:
+	max_matrix = st.number_input("最大列数(散布行列)", min_value=2, max_value=20, value=min(10, max(2, len(num_cols_all))))
+	num_for_matrix = num_cols_all[: int(max_matrix)]
+	if len(num_for_matrix) >= 2:
+		base = alt.Chart(fdf.dropna(subset=num_for_matrix)).properties(width=120, height=120)
+		scatter = base.mark_circle(size=20, opacity=0.5).encode(
+			x=alt.X(alt.repeat("column"), type="quantitative"),
+			y=alt.Y(alt.repeat("row"), type="quantitative"),
+			tooltip=[alt.Tooltip(c, type="quantitative") for c in num_for_matrix],
+		)
+		chart = scatter.repeat(row=num_for_matrix, column=num_for_matrix)
+		st.altair_chart(chart, use_container_width=True)
+	else:
+		st.info("数値列が2列以上必要です")
+
+# クロス集計（カテゴリ×カテゴリ）
+with tabs[2]:
+	if len(cat_cols_all) >= 2:
+		c1 = st.selectbox("カテゴリ1", cat_cols_all, key="crosstab_c1")
+		c2 = st.selectbox("カテゴリ2", cat_cols_all, index=min(1, len(cat_cols_all)-1), key="crosstab_c2")
+		limit = st.slider("各カテゴリの上位件数(頻度順)", 2, 50, 20)
+		t1 = fdf[c1].astype(str).value_counts().head(limit).index
+		t2 = fdf[c2].astype(str).value_counts().head(limit).index
+		pivot = pd.crosstab(fdf[c1].astype(str).where(lambda s: s.isin(t1), other="その他"),
+							fdf[c2].astype(str).where(lambda s: s.isin(t2), other="その他"))
+		st.dataframe(pivot)
+		melt = pivot.reset_index().melt(id_vars=c1)
+		melt.columns = [c1, c2, "件数"]
+		chart = alt.Chart(melt).mark_rect().encode(
+			x=alt.X(f"{c2}:O", sort="-y"),
+			y=alt.Y(f"{c1}:O", sort="-x"),
+			color=alt.Color("件数:Q", scale=alt.Scale(scheme="blues")),
+			tooltip=[c1, c2, "件数"],
+		).properties(height=500)
+		st.altair_chart(chart, use_container_width=True)
+	else:
+		st.info("カテゴリ列が2列以上必要です")
+
+# グループ統計（カテゴリ→数値）
+with tabs[3]:
+	if len(cat_cols_all) >= 1 and len(num_cols_all) >= 1:
+		gc = st.selectbox("カテゴリ列", cat_cols_all, key="group_cat")
+		metrics = st.multiselect("数値列（統計対象）", num_cols_all, default=num_cols_all[:min(5, len(num_cols_all))])
+		aggs = st.multiselect("集計関数", ["count", "mean", "median", "min", "max", "std", "sum"], default=["count", "mean", "median"])
+		if metrics and aggs:
+			g = fdf.groupby(gc)[metrics].agg(aggs)
+			st.dataframe(g)
+			# 選択1指標を棒グラフ
+			col_metric = st.selectbox("可視化する列", metrics)
+			col_agg = st.selectbox("可視化する集計", aggs)
+			plot_df = g[col_metric][col_agg].reset_index().sort_values(by=col_agg, ascending=False)
+			bar = alt.Chart(plot_df).mark_bar().encode(x=alt.X(gc, sort='-y'), y=alt.Y(col_agg, title=f"{col_metric} ({col_agg})"))
+			st.altair_chart(bar.properties(height=400), use_container_width=True)
+	else:
+		st.info("カテゴリ列と数値列が必要です")
+
+# ========== 表示 ==========
+st.subheader("データ表示")
+st.dataframe(fdf, use_container_width=True)
+
+# ========== 図表(自由作図) ==========
+st.subheader("図表作成")
+num_cols = [c for c in fdf.columns if pd.api.types.is_numeric_dtype(fdf[c])]
+cat_cols = [c for c in fdf.columns if not pd.api.types.is_numeric_dtype(fdf[c])]
+chart_type = st.selectbox("チャート種別", ["棒", "折れ線", "散布図", "箱ひげ"])
+x_col = st.selectbox("X軸 (カテゴリor数値)", [None] + cat_cols + num_cols)
+y_col = st.selectbox("Y軸 (数値)", [None] + num_cols)
+color_col = st.selectbox("色分け", [None] + cat_cols + num_cols)
+
+if x_col and y_col:
+	base = alt.Chart(fdf.dropna(subset=[x_col, y_col])).encode(x=x_col, y=y_col)
+	if color_col:
+		base = base.encode(color=color_col)
+	if chart_type == "棒":
+		ch = base.mark_bar()
+	elif chart_type == "折れ線":
+		ch = base.mark_line(point=True)
+	elif chart_type == "散布図":
+		ch = base.mark_circle(size=60)
+	else:
+		ch = alt.Chart(fdf).mark_boxplot().encode(x=x_col, y=y_col, color=color_col if color_col else alt.value("steelblue"))
+	st.altair_chart(ch.properties(height=400), use_container_width=True)
+else:
+	st.info("X軸とY軸を選択するとチャートが表示されます")
+
+# ========== ダウンロード ==========
+st.subheader("ダウンロード")
+st.download_button(
+	"現在の絞込結果をCSVで保存",
+	data=fdf.to_csv(index=False).encode("utf-8-sig"),
+	file_name="filtered.csv",
+	mime="text/csv",
 )
 
-def load_excel_data(uploaded_file):
-    """A6セルからデータを読み込み"""
-    try:
-        df = pd.read_excel(uploaded_file, header=4)  # A6 = 5行目
-        df.columns = df.columns.astype(str).str.strip()
-        st.success(f"データの読み込みに成功しました！データ形状: {df.shape}")
-        return df
-    except Exception as e:
-        st.error(f"ファイル読み込みエラー: {str(e)}")
-        return None
 
-def clean_data(df):
-    """データクリーニング：空白セルと混合型セルを除去"""
-    df_cleaned = df.copy()
-    original_shape = df_cleaned.shape
-    
-    # 完全に空白の行と列を除去
-    df_cleaned = df_cleaned.dropna(how="all").dropna(axis=1, how="all")
-    
-    # 混合型列を除去
-    columns_to_remove = []
-    for col in df_cleaned.columns:
-        numeric_count = 0
-        non_numeric_count = 0
-        for value in df_cleaned[col].dropna():
-            try:
-                float(str(value))
-                numeric_count += 1
-            except:
-                non_numeric_count += 1
-        if numeric_count > 0 and non_numeric_count > 0:
-            columns_to_remove.append(col)
-    
-    if columns_to_remove:
-        st.warning(f"混合型列を検出し、除去しました: {columns_to_remove}")
-        df_cleaned = df_cleaned.drop(columns=columns_to_remove)
-    
-    # 空白セルを除去
-    df_cleaned = df_cleaned.dropna()
-    st.info(f"データクリーニング完了！元の形状: {original_shape} → クリーニング後: {df_cleaned.shape}")
-    return df_cleaned
-
-def identify_column_types(df):
-    """数値列とテキスト列を識別"""
-    numeric_columns = []
-    text_columns = []
-    for col in df.columns:
-        numeric_series = pd.to_numeric(df[col], errors="coerce")
-        if not numeric_series.isna().any():
-            numeric_columns.append(col)
-        else:
-            text_columns.append(col)
-    return numeric_columns, text_columns
-
-def cluster_text_data(df, text_column, n_clusters=3):
-    """テキストデータのクラスタリング"""
-    if text_column not in df.columns or len(df[text_column].dropna()) < 2:
-        return df
-    
-    text_data = df[text_column].dropna().astype(str)
-    vectorizer = TfidfVectorizer(max_features=100, stop_words=None)
-    tfidf_matrix = vectorizer.fit_transform(text_data)
-    
-    kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
-    cluster_labels = kmeans.fit_predict(tfidf_matrix)
-    
-    df_clustered = df.copy()
-    text_to_cluster = dict(zip(text_data, cluster_labels))
-    df_clustered[f"{text_column}_cluster"] = df_clustered[text_column].map(text_to_cluster)
-    
-    st.success(f"テキストデータのクラスタリング完了！{n_clusters}個のグループに分類")
-    return df_clustered
-
-def create_chart(df, x_col, y_col, chart_type):
-    """チャート作成"""
-    if chart_type == "scatter":
-        fig = px.scatter(df, x=x_col, y=y_col, title=f"{x_col} vs {y_col} 散布図")
-    elif chart_type == "line":
-        fig = px.line(df, x=x_col, y=y_col, title=f"{x_col} vs {y_col} 折れ線グラフ")
-    elif chart_type == "bar":
-        if df[x_col].dtype in ["object", "string"]:
-            summary = df.groupby(x_col)[y_col].mean().reset_index()
-            fig = px.bar(summary, x=x_col, y=y_col, title=f"{x_col} vs {y_col} 棒グラフ")
-        else:
-            fig = px.histogram(df, x=x_col, title=f"{x_col} 分布ヒストグラム")
-    elif chart_type == "box":
-        if df[x_col].dtype in ["object", "string"]:
-            fig = px.box(df, x=x_col, y=y_col, title=f"{x_col} vs {y_col} 箱ひげ図")
-        else:
-            fig = px.box(df, y=y_col, title=f"{y_col} 箱ひげ図")
-    elif chart_type == "heatmap":
-        if df[x_col].dtype in ["int64", "float64"] and df[y_col].dtype in ["int64", "float64"]:
-            fig = px.density_heatmap(df, x=x_col, y=y_col, title=f"{x_col} vs {y_col} 密度ヒートマップ")
-        else:
-            st.warning("ヒートマップは数値データのみに適用可能です")
-            return None
-    
-    fig.update_layout(height=500)
-    return fig
-
-def export_data(df, format_type):
-    """データエクスポート"""
-    if format_type == "xlsx":
-        output = io.BytesIO()
-        with pd.ExcelWriter(output, engine="openpyxl") as writer:
-            df.to_excel(writer, index=False, sheet_name="分析結果")
-        return output.getvalue()
-    elif format_type == "csv":
-        return df.to_csv(index=False).encode("utf-8-sig")
-
-def main():
-    st.title("🏭 下水処理場データ分析システム")
-    
-    # ファイルアップロード
-    uploaded_file = st.sidebar.file_uploader("Excelファイルをアップロードしてください", type=["xlsx", "xls"])
-    
-    if uploaded_file is not None:
-        # データ読み込み
-        df = load_excel_data(uploaded_file)
-        if df is not None:
-            # データクリーニング
-            df_cleaned = clean_data(df)
-            if not df_cleaned.empty:
-                # 列タイプ識別
-                numeric_columns, text_columns = identify_column_types(df_cleaned)
-                
-                # 分析設定
-                st.sidebar.header("分析設定")
-                x_column = st.sidebar.selectbox("X軸列", df_cleaned.columns.tolist())
-                y_column = st.sidebar.selectbox("Y軸列", df_cleaned.columns.tolist())
-                chart_type = st.sidebar.selectbox("チャートタイプ", ["scatter", "line", "bar", "box", "heatmap"])
-                
-                # テキストクラスタリング
-                if text_columns:
-                    cluster_text = st.sidebar.checkbox("テキストクラスタリングを有効化")
-                    if cluster_text:
-                        text_col = st.sidebar.selectbox("クラスタリング対象のテキスト列を選択", text_columns)
-                        n_clusters = st.sidebar.slider("クラスター数", 2, 10, 3)
-                        df_cleaned = cluster_text_data(df_cleaned, text_col, n_clusters)
-                
-                # データプレビュー表示
-                st.subheader("データプレビュー")
-                st.dataframe(df_cleaned.head(10))
-                
-                # チャート作成
-                st.subheader("可視化分析")
-                fig = create_chart(df_cleaned, x_column, y_column, chart_type)
-                if fig:
-                    st.plotly_chart(fig, use_container_width=True)
-                
-                # 統計分析
-                st.subheader("統計分析")
-                col1, col2 = st.columns(2)
-                with col1:
-                    st.write(f"**{x_column} 統計情報:**")
-                    if df_cleaned[x_column].dtype in ["int64", "float64"]:
-                        st.write(df_cleaned[x_column].describe())
-                    else:
-                        st.write(f"ユニーク値数: {df_cleaned[x_column].nunique()}")
-                
-                with col2:
-                    st.write(f"**{y_column} 統計情報:**")
-                    if df_cleaned[y_column].dtype in ["int64", "float64"]:
-                        st.write(df_cleaned[y_column].describe())
-                    else:
-                        st.write(f"ユニーク値数: {df_cleaned[y_column].nunique()}")
-                
-                # 相関分析
-                if df_cleaned[x_column].dtype in ["int64", "float64"] and df_cleaned[y_column].dtype in ["int64", "float64"]:
-                    correlation = df_cleaned[x_column].corr(df_cleaned[y_column])
-                    st.write(f"**相関係数:** {correlation:.4f}")
-                
-                # エクスポート機能
-                st.subheader("データエクスポート")
-                col1, col2 = st.columns(2)
-                with col1:
-                    if st.button("Excelでエクスポート"):
-                        data = export_data(df_cleaned, "xlsx")
-                        st.download_button("Excelファイルをダウンロード", data, "分析結果.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-                with col2:
-                    if st.button("CSVでエクスポート"):
-                        data = export_data(df_cleaned, "csv")
-                        st.download_button("CSVファイルをダウンロード", data, "分析結果.csv", "text/csv")
-                
-                # 完全データ表示
-                st.subheader("完全データ")
-                st.dataframe(df_cleaned)
-    else:
-        st.info("Excelファイルをアップロードして分析を開始してください")
-
-if __name__ == "__main__":
-    main()
