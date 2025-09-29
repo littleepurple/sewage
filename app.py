@@ -38,13 +38,26 @@ def load_dataframe(file, encoding_hint: str) -> pd.DataFrame:
 def clean_columns(df: pd.DataFrame) -> pd.DataFrame:
 	if df.empty:
 		return df
-	header_row_idx = 0
-	max_nonempty = -1
-	for i in range(min(10, len(df))):
-		nonempty = (df.iloc[i].astype(str).str.strip() != "").sum()
-		if nonempty > max_nonempty:
-			max_nonempty = nonempty
+	# ヘッダー候補の検出を強化
+	keywords = ["都道府県", "自治体コード", "処理場名", "処理能力", "処理方式"]
+	header_row_idx = None
+	max_search = min(100, len(df))
+	for i in range(max_search):
+		row_strs = df.iloc[i].astype(str).fillna("")
+		joined = "\t".join(row_strs.values)
+		if any(k in joined for k in keywords):
 			header_row_idx = i
+			break
+	# キーワードで見つからなければ、情報量の多い行を採用（先頭50行）
+	if header_row_idx is None:
+		max_nonempty = -1
+		fallback_search = min(50, len(df))
+		for i in range(fallback_search):
+			nonempty = (df.iloc[i].astype(str).str.strip() != "").sum()
+			if nonempty > max_nonempty:
+				max_nonempty = nonempty
+				header_row_idx = i
+	# 列名生成
 	new_cols = (
 		df.iloc[header_row_idx]
 		.astype(str)
@@ -64,9 +77,24 @@ def clean_columns(df: pd.DataFrame) -> pd.DataFrame:
 			k = f"{base}_{n}"
 		counts[k] = 1
 		fixed_cols.append(k)
+	# 本体抽出（0行防止のフォールバックあり）
 	body = df.iloc[header_row_idx + 1 :].copy()
+	if body.shape[0] == 0:
+		# ヘッダー行も含めて戻す（空回避）
+		body = df.iloc[header_row_idx :].copy()
+	# 列数調整
+	if len(fixed_cols) != body.shape[1]:
+		# 列数がずれた場合は切り詰め/パディング
+		if len(fixed_cols) > body.shape[1]:
+			fixed_cols = fixed_cols[: body.shape[1]]
+		else:
+			# 足りない分は連番列を追加
+			extra = [f"col_extra_{i}" for i in range(1, body.shape[1] - len(fixed_cols) + 1)]
+			fixed_cols = fixed_cols + extra
 	body.columns = fixed_cols
-	return body.reset_index(drop=True)
+	# 全空行は削除
+	body = body.dropna(how="all").reset_index(drop=True)
+	return body
 
 @st.cache_data(show_spinner=False)
 def coerce_types(df: pd.DataFrame) -> pd.DataFrame:
@@ -155,7 +183,7 @@ else:
 num_cols_all = [c for c in compare_cols if pd.api.types.is_numeric_dtype(fdf[c])]
 cat_cols_all = [c for c in compare_cols if not pd.api.types.is_numeric_dtype(fdf[c])]
 
- tabs = st.tabs(["相関ヒートマップ(数値)", "散布行列(数値)", "クロス集計(カテゴリ×カテゴリ)", "グループ統計(カテゴリ→数値)"])
+tabs = st.tabs(["相関ヒートマップ(数値)", "散布行列(数値)", "クロス集計(カテゴリ×カテゴリ)", "グループ統計(カテゴリ→数値)"])
 
 # 相関ヒートマップ
 with tabs[0]:
@@ -234,6 +262,63 @@ with tabs[3]:
 st.subheader("データ表示")
 st.dataframe(fdf, use_container_width=True)
 
+# ========== ドリルダウン ==========
+st.subheader("インタラクティブ・ドリルダウン（数値→カテゴリ）")
+num_cols = [c for c in fdf.columns if pd.api.types.is_numeric_dtype(fdf[c])]
+cat_cols = [c for c in fdf.columns if not pd.api.types.is_numeric_dtype(fdf[c])]
+
+# デフォルト推定
+default_num = None
+for key in ["処理人口", "人口", "処理能力", "面積"]:
+	for c in fdf.columns:
+		if key in str(c):
+			default_num = c
+			break
+	if default_num:
+		break
+if not default_num and num_cols:
+	default_num = num_cols[0]
+
+default_cat = None
+for key in ["処理方式", "水処理方式", "方式", "放流先"]:
+	for c in fdf.columns:
+		if key in str(c):
+			default_cat = c
+			break
+	if default_cat:
+		break
+if not default_cat and cat_cols:
+	default_cat = cat_cols[0]
+
+col_a, col_b = st.columns(2)
+with col_a:
+	num_col = st.selectbox("数値列（例: 処理人口）", num_cols, index=(num_cols.index(default_num) if default_num in num_cols else 0) if num_cols else None)
+with col_b:
+	cat_col = st.selectbox("カテゴリ列（例: 処理方式）", cat_cols, index=(cat_cols.index(default_cat) if default_cat in cat_cols else 0) if cat_cols else None)
+
+if num_col and cat_col:
+	df2 = fdf.dropna(subset=[num_col, cat_col]).copy()
+	try:
+		import altair as alt
+		brush = alt.selection_interval(encodings=['x'])
+		hist = alt.Chart(df2).mark_bar().encode(
+			x=alt.X(f"{num_col}:Q", bin=alt.Bin(maxbins=30), title=num_col),
+			y=alt.Y('count()', title='件数')
+		).properties(height=150)
+		bars = alt.Chart(df2).mark_bar().encode(
+			x=alt.X(f"{cat_col}:N", sort='-y', title=cat_col),
+			y=alt.Y('count()', title='件数'),
+			tooltip=[cat_col, alt.Tooltip('count()', title='件数')]
+		).transform_filter(brush)
+		st.altair_chart((hist.add_params(brush) & bars).resolve_scale(y='independent'), use_container_width=True)
+	except Exception:
+		st.warning("可視化でエラーが発生しました。列を変更してお試しください。")
+	# 集計テーブル
+	g = df2.groupby(pd.cut(pd.to_numeric(df2[num_col], errors='coerce'), bins=10))[cat_col].value_counts().rename('件数').reset_index()
+	st.dataframe(g, use_container_width=True)
+else:
+	st.info("数値列とカテゴリ列を選択してください")
+
 # ========== 図表(自由作図) ==========
 st.subheader("図表作成")
 num_cols = [c for c in fdf.columns if pd.api.types.is_numeric_dtype(fdf[c])]
@@ -267,5 +352,7 @@ st.download_button(
 	file_name="filtered.csv",
 	mime="text/csv",
 )
+
+
 
 
