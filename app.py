@@ -155,7 +155,7 @@ priority_col = next((c for c in candidate_pop_cols if "事業計画" in c and "�
 if priority_col is None and candidate_pop_cols:
 	priority_col = candidate_pop_cols[0]
 
-default_x_index = df.columns.get_loc(priority_col) if priority_col in df.columns if priority_col else 0
+default_x_index = df.columns.get_loc(priority_col) if (priority_col and priority_col in df.columns) else 0
 
 with col_config_1:
 	st.subheader("1つ目のカテゴリ (X)")
