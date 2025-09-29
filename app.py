@@ -5,6 +5,7 @@ import numpy as np
 import pandas as pd
 import plotly.express as px
 import streamlit as st
+from pathlib import Path
 
 st.set_page_config(page_title="2列カテゴリ比較アプリ", layout="wide")
 
@@ -84,12 +85,44 @@ def make_categorical(series: pd.Series, mode: str, bins: int, precision: int = 2
 		return rounded
 
 
+# 追加: 処理人口の簡易グループ分け
+POP_BIN_EDGES = [0, 5000, 50000, 200000, 500000, float("inf")]
+POP_BIN_LABELS = ["〜5千人", "5千〜5万人", "5万〜20万人", "20万〜50万人", "50万人〜"]
+
+def to_number_series(s: pd.Series) -> pd.Series:
+	# カンマ・全角スペース等の除去して数値化
+	return pd.to_numeric(
+		s.astype(str)
+		 .str.replace(",", "", regex=False)
+		 .str.replace("　", "", regex=False)
+		 .str.replace(" ", "", regex=False)
+		 .str.replace("−", "-", regex=False)
+		 , errors="coerce"
+	)
+
+@st.cache_data(show_spinner=False)
+def simple_population_group(series_like: pd.Series) -> pd.Series:
+	values = to_number_series(series_like)
+	cats = pd.cut(values, bins=POP_BIN_EDGES, labels=POP_BIN_LABELS, include_lowest=True, right=False)
+	return cats.astype(str)
+
+
 # サイドバー: ファイル読み込み
 with st.sidebar:
 	st.header("データ入力")
 	uploaded = st.file_uploader("CSV または Excel", type=["csv", "xlsx", "xls"])
 	st.markdown("—")
 	st.caption("数値列は自動でビニングしてカテゴリ化できます。")
+	show_code = st.toggle("コードを表示", value=True)
+	if show_code:
+		try:
+			code_text = Path(__file__).read_text(encoding="utf-8")
+			st.code(code_text, language="python")
+		except Exception:
+			st.info("コードの読み込みに失敗しました。")
+	st.markdown("—")
+	st.subheader("簡易モード")
+	use_simple_pop = st.toggle("処理人口を少数グループにまとめる", value=False, help="『処理人口』と名のつく列を自動検出し、固定ビンで5区分にまとめます")
 
 if not uploaded:
 	st.info("ファイルをサイドバーからアップロードしてください。")
@@ -110,15 +143,33 @@ with st.expander("データの先頭 (50行)"):
 # 列選択とカテゴリ化設定
 col_config_1, col_config_2, misc_cfg = st.columns([1.2, 1.2, 0.8])
 
+# 自動検出: 処理人口っぽい列
+candidate_pop_cols = [c for c in df.columns if "処理人口" in str(c)]
+default_x_index = 0
+if candidate_pop_cols:
+	try:
+		default_x_index = df.columns.get_loc(candidate_pop_cols[0])
+	except Exception:
+		default_x_index = 0
+
 with col_config_1:
 	st.subheader("1つ目のカテゴリ (X)")
-	col_x = st.selectbox("列を選択", df.columns, index=0, key="col_x")
-	mode_x = st.selectbox("カテゴリ化方法", ["auto", "as_is", "qcut", "cut"], index=0, key="mode_x",
-		help="auto: 数値は分位数ビンに、文字列/日時はそのまま")
-	bins_x = st.slider("ビン数 (数値列)", 2, 20, 5, key="bins_x")
-	s_x = make_categorical(df[col_x], mode_x, bins_x)
-	cats_x_all = pd.Index(s_x.dropna().unique()).astype(str).tolist()
-	selected_cats_x = st.multiselect("カテゴリ値を選択 (複数可)", cats_x_all, default=cats_x_all[:min(10, len(cats_x_all))])
+	col_x = st.selectbox("列を選択", df.columns, index=default_x_index, key="col_x")
+	if use_simple_pop and ("処理人口" in str(col_x)):
+		st.caption("簡易グループ: 〜5千 / 5千〜5万 / 5万〜20万 / 20万〜50万 / 50万〜")
+		mode_x = "simple_population"
+		bins_x = 5
+		# 先にカテゴリ化（固定ビン）
+		s_x = simple_population_group(df[col_x])
+		cats_x_all = pd.Index(s_x.dropna().unique()).astype(str).tolist()
+		selected_cats_x = st.multiselect("人口グループを選択", cats_x_all, default=cats_x_all)
+	else:
+		mode_x = st.selectbox("カテゴリ化方法", ["auto", "as_is", "qcut", "cut"], index=0, key="mode_x",
+			help="auto: 数値は分位数ビンに、文字列/日時はそのまま")
+		bins_x = st.slider("ビン数 (数値列)", 2, 20, 5, key="bins_x")
+		s_x = make_categorical(df[col_x], mode_x, bins_x)
+		cats_x_all = pd.Index(s_x.dropna().unique()).astype(str).tolist()
+		selected_cats_x = st.multiselect("カテゴリ値を選択 (複数可)", cats_x_all, default=cats_x_all[:min(10, len(cats_x_all))])
 
 with col_config_2:
 	st.subheader("2つ目のカテゴリ/数値 (Y)")
@@ -139,7 +190,10 @@ with misc_cfg:
 	sort_desc = st.toggle("集計を降順で表示", value=True)
 
 # 1つ目のカテゴリ選択でフィルタ
-s_x = make_categorical(df[col_x], mode_x, bins_x)
+if use_simple_pop and ("処理人口" in str(col_x)):
+	s_x = simple_population_group(df[col_x])
+else:
+	s_x = make_categorical(df[col_x], "as_is" if not is_numeric(df[col_x]) else mode_x, bins_x)
 mask_x = s_x.isin(selected_cats_x) if selected_cats_x else pd.Series([True] * len(df), index=df.index)
 filtered_df = df[mask_x].copy()
 
@@ -167,7 +221,7 @@ with st.expander("絞り込み後データ (先頭)", expanded=False):
 
 with tab_ct:
 	if as_category_y:
-		cx = make_categorical(filtered_df2[col_x], mode_x, bins_x)
+		cx = s_x.loc[filtered_df2.index]
 		cy = make_categorical(filtered_df2[col_y], mode_y, bins_y)
 		ct = pd.crosstab(cx, cy)
 		if sort_desc:
@@ -177,28 +231,55 @@ with tab_ct:
 		st.plotly_chart(fig, use_container_width=True)
 	else:
 		# Yが数値のときはXカテゴリごとの集計
-		cx = make_categorical(filtered_df2[col_x], mode_x, bins_x)
+		cx = s_x.loc[filtered_df2.index]
 		agg = filtered_df2.groupby(cx, dropna=False)[col_y].mean().reset_index().rename(columns={col_y: f"{col_y} (mean)"})
 		agg = agg.sort_values(agg.columns[-1], ascending=not sort_desc)
 		st.dataframe(agg, use_container_width=True)
 
 with tab_plot:
 	if as_category_y:
-		# カテゴリ×カテゴリ → 積み上げ/ヒートマップ/棒
-		cx = make_categorical(filtered_df2[col_x], mode_x, bins_x)
+		cx = s_x.loc[filtered_df2.index]
 		cy = make_categorical(filtered_df2[col_y], mode_y, bins_y)
 		df_plot = (
 			filtered_df2.assign(X=cx, Y=cy)
 			.groupby(["X", "Y"]).size().reset_index(name="count")
 		)
-		if bar_orientation == "vertical":
-			fig = px.bar(df_plot, x="X", y="count", color="Y", barmode="stack")
+		# 追加: 表示オプション（割合表示・上位N方法）
+		opt1, opt2, opt3 = st.columns([0.8, 0.8, 1])
+		with opt1:
+			show_share = st.toggle("割合(100%)で表示", value=True)
+		with opt2:
+			top_k = st.slider("方法の上位Nを表示", 3, 20, 8)
+		with opt3:
+			show_values = st.toggle("値ラベルを表示", value=False)
+		# 上位N方法の抽出（全体件数で）
+		method_order = df_plot.groupby("Y")["count"].sum().sort_values(ascending=False).index.tolist()
+		keep_methods = set(method_order[:top_k])
+		df_plot = df_plot[df_plot["Y"].isin(keep_methods)]
+		# 割合計算
+		if show_share:
+			df_tot = df_plot.groupby("X")["count"].sum().rename("total").reset_index()
+			df_plot = df_plot.merge(df_tot, on="X", how="left")
+			df_plot["share"] = df_plot["count"] / df_plot["total"]
+			if bar_orientation == "vertical":
+				fig = px.bar(df_plot, x="X", y="share", color="Y", barmode="stack")
+				fig.update_yaxes(tickformat=",.0%", range=[0,1])
+			else:
+				fig = px.bar(df_plot, y="X", x="share", color="Y", barmode="stack", orientation="h")
+				fig.update_xaxes(tickformat=",.0%", range=[0,1])
 		else:
-			fig = px.bar(df_plot, y="X", x="count", color="Y", barmode="stack", orientation="h")
+			if bar_orientation == "vertical":
+				fig = px.bar(df_plot, x="X", y="count", color="Y", barmode="stack")
+			else:
+				fig = px.bar(df_plot, y="X", x="count", color="Y", barmode="stack", orientation="h")
+		# ラベル
+		if show_values:
+			fig.update_traces(texttemplate="%{y:.0%}" if show_share and bar_orientation=="vertical" else ("%{x:.0%}" if show_share else "%{y}" if bar_orientation=="vertical" else "%{x}"), textposition="inside")
+		# 凡例順序
+		fig.update_layout(legend_traceorder="normal")
 		st.plotly_chart(fig, use_container_width=True)
 	else:
-		# カテゴリ(X) × 数値(Y) → 棒グラフ
-		cx = make_categorical(filtered_df2[col_x], mode_x, bins_x)
+		cx = s_x.loc[filtered_df2.index]
 		agg = filtered_df2.groupby(cx, dropna=False)[col_y].mean().reset_index(name=f"{col_y} (mean)")
 		if bar_orientation == "vertical":
 			fig = px.bar(agg, x=cx.name, y=f"{col_y} (mean)")
@@ -212,7 +293,7 @@ with tab_stats:
 		st.subheader(f"{col_y} の要約統計 (絞り込み後)")
 		st.dataframe(filtered_df2[col_y].describe().to_frame().T, use_container_width=True)
 		# Xカテゴリごとの統計
-		cx = make_categorical(filtered_df2[col_x], mode_x, bins_x)
+		cx = s_x.loc[filtered_df2.index]
 		agg = filtered_df2.groupby(cx, dropna=False)[col_y].agg(["count", "mean", "median", "min", "max"]).reset_index()
 		st.dataframe(agg, use_container_width=True)
 	else:
@@ -226,6 +307,5 @@ st.download_button(
 	file_name="filtered.csv",
 	mime="text/csv",
 )
-
 
 
