@@ -63,9 +63,9 @@ def make_summary(df, process_col, xcol, ycol):
     return summ
 
 @st.cache_data(show_spinner=False)
-def read_excel_with_header(file, sheet_name=None, header_row_zero=0):
-    """指定シート＆ヘッダー行で読み込み"""
-    df = pd.read_excel(file, sheet_name=sheet_name, header=header_row_zero, engine="openpyxl")
+def read_excel_with_header(file_like, sheet_name=None, header_row_zero=0):
+    """指定シート＆ヘッダー行で読み込み。file_like は BytesIO 等。"""
+    df = pd.read_excel(file_like, sheet_name=sheet_name, header=header_row_zero, engine="openpyxl")
     if isinstance(df, dict):  # sheet_name=None のとき複数返る
         first = list(df.keys())[0]
         df = df[first]
@@ -81,8 +81,11 @@ if uploaded is None:
     st.info("左サイドバーにExcelをドラッグ＆ドロップしてください。")
     st.stop()
 
-# シート名の先読み
-with pd.ExcelFile(uploaded, engine="openpyxl") as xls:
+# Bytes を一度だけ取得し、以降は BytesIO を都度生成（読み取り位置問題を防止）
+data_bytes = uploaded.getvalue()
+
+# シート名一覧
+with pd.ExcelFile(io.BytesIO(data_bytes), engine="openpyxl") as xls:
     sheets = xls.sheet_names
 
 sheet_name = st.sidebar.selectbox("シートを選択", options=sheets, index=0)
@@ -90,7 +93,7 @@ header_row_1based = st.sidebar.number_input("ヘッダー行（1 = 1行目）", 
 header_row_zero = int(header_row_1based - 1)
 
 # 読み込み
-df = read_excel_with_header(uploaded, sheet_name=sheet_name, header_row_zero=header_row_zero)
+df = read_excel_with_header(io.BytesIO(data_bytes), sheet_name=sheet_name, header_row_zero=header_row_zero)
 cols = list(df.columns)
 
 st.title("①〜④構成：方式別で『処理人口 × 処理能力』を見る")
@@ -132,8 +135,8 @@ if missing_labels:
     st.error("次の列を指定してください： " + "、".join(missing_labels))
     st.stop()
 
-# ========= クレンジング：元データを保持しつつヘルパー列を追加 =========
-df_all = df.copy()  # ← 全列保持（④で表示・DL用）
+# ========= クレンジング：元データ保持＋ヘルパー列 =========
+df_all = df.copy()  # 全列保持（④で表示・DL用）
 df_all["_process"]   = df_all[sel_process].astype(str).str.strip()
 df_all["_pop_total"] = df_all[sel_pop].apply(to_numeric)
 df_all["_cap_max"]   = df_all[sel_cap].apply(to_numeric)
@@ -148,5 +151,99 @@ valid_mask = (
 st.markdown("## ① 「水処理方式現有」を選択")
 all_procs = sorted(df_all.loc[valid_mask, "_process"].unique().tolist())
 selected_procs = st.multiselect("方式（複数選択可）", options=all_procs, default=all_procs)
+
 mask = valid_mask if len(selected_procs) == 0 else (valid_mask & df_all["_process"].isin(selected_procs))
-filtered_full = df_all.
+filtered_full = df_all.loc[mask].copy()  # ← 全列保持のフィルタ済みデータ
+
+if filtered_full.empty:
+    st.warning("選択された方式に該当するデータがありません。方式または列指定を見直してください。")
+    st.stop()
+
+# ========= ② 比較したい列を選択 =========
+st.markdown("## ② 比較したい列を選択")
+cc1, cc2 = st.columns(2)
+with cc1:
+    x_label = st.radio("横軸", ["処理人口（人）全体計画", "処理能力（㎥/日最大）現有"], index=0, horizontal=True)
+with cc2:
+    y_label = st.radio("縦軸", ["処理人口（人）全体計画", "処理能力（㎥/日最大）現有"], index=1, horizontal=True)
+
+if x_label == y_label:
+    st.warning("横軸と縦軸は異なる項目を選んでください。")
+    st.stop()
+
+opt1, opt2, opt3 = st.columns(3)
+with opt1:
+    logx = st.checkbox("横軸を対数（log10）", value=False)
+with opt2:
+    logy = st.checkbox("縦軸を対数（log10）", value=False)
+with opt3:
+    trend = st.checkbox("トレンド線（OLS）", value=False)
+
+# ========= ③ 図・評価 =========
+st.markdown("## ③ 図・評価")
+# 描画用の最小データ（方式＋数値2列）
+plot_df = filtered_full.rename(
+    columns={"_process": "水処理方式現有", "_pop_total": "処理人口（人）全体計画", "_cap_max": "処理能力（㎥/日最大）現有"}
+)[["水処理方式現有", "処理人口（人）全体計画", "処理能力（㎥/日最大）現有"]].copy()
+
+plot_df = plot_df.rename(columns={x_label: "X", y_label: "Y"})[["水処理方式現有", "X", "Y"]]
+plot_df = plot_df[(plot_df["X"] > 0) & (plot_df["Y"] > 0)]
+if plot_df.empty:
+    st.warning("有効なデータがありません。列指定や方式の選択を見直してください。")
+    st.stop()
+
+trend_arg = "ols" if trend else None
+fig = px.scatter(
+    plot_df,
+    x="X", y="Y",
+    color="水処理方式現有",
+    hover_data={"水処理方式現有": True, "X": ":,", "Y": ":,"},
+    trendline=trend_arg,
+    trendline_scope="trace",  # 方式ごと
+)
+fig.update_traces(marker=dict(size=10, opacity=0.85))
+if logx:
+    fig.update_xaxes(type="log")
+if logy:
+    fig.update_yaxes(type="log")
+fig.update_layout(
+    xaxis_title=x_label,
+    yaxis_title=y_label,
+    legend_title="水処理方式",
+    margin=dict(l=15, r=15, t=30, b=15),
+)
+st.plotly_chart(fig, use_container_width=True)
+
+st.subheader("方式別サマリ")
+summary_df = make_summary(plot_df, "水処理方式現有", "X", "Y")
+for c in ["X平均", "X中央値", "Y平均", "Y中央値"]:
+    summary_df[c] = summary_df[c].round(2)
+st.dataframe(summary_df, use_container_width=True)
+
+corr = np.corrcoef(plot_df["X"], plot_df["Y"])[0, 1]
+st.caption(f"全体相関係数（Pearson r）: **{corr:.3f}**")
+
+# ========= ④ 詳細データ（全列） =========
+st.markdown("## ④ 詳細データ（全列）")
+detail_df = filtered_full.drop(columns=["_process", "_pop_total", "_cap_max"], errors="ignore")
+st.dataframe(detail_df.reset_index(drop=True), use_container_width=True, height=380)
+
+c3, c4 = st.columns(2)
+with c3:
+    st.download_button(
+        "CSVで保存（全列・BOM付き）",
+        data=bom_csv(detail_df),
+        file_name="filtered_full_columns.csv",
+        mime="text/csv",
+    )
+with c4:
+    out = io.BytesIO()
+    with pd.ExcelWriter(out, engine="openpyxl") as writer:
+        detail_df.to_excel(writer, index=False, sheet_name="filtered_full_columns")
+        summary_df.to_excel(writer, index=False, sheet_name="summary_by_process")
+    st.download_button(
+        "Excelで保存（全列＋サマリ）",
+        data=out.getvalue(),
+        file_name="filtered_full_columns_and_summary.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
