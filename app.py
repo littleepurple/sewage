@@ -41,9 +41,7 @@ def to_numeric(x):
         return np.nan
     s = str(x)
     s = re.sub(r"[,\s]", "", s)
-    # en/emダッシュ類は欠損扱いのことが多いので除去
     s = s.replace("―", "").replace("—", "")
-    # ハイフン '-' は負数で使う場合があるが、このデータでは負数想定なし。欠損表記の '-' を除去。
     s = s.replace("-", "")
     try:
         return float(s)
@@ -84,7 +82,7 @@ if uploaded is None:
     st.info("左サイドバーにExcelをドラッグ＆ドロップしてください。")
     st.stop()
 
-# Bytes を一度だけ取得し、以降は BytesIO を都度生成（読み取り位置問題を防止）
+# Bytes を一度だけ取得
 data_bytes = uploaded.getvalue()
 
 # シート名一覧
@@ -103,32 +101,44 @@ st.title("①〜④構成：方式別で『処理人口 × 処理能力』を見
 with st.expander("データ先頭プレビュー（列名を確認）", expanded=False):
     st.dataframe(df.head(10), use_container_width=True)
 
-# ========= 列の自動検出＋必須の手動選択 =========
-auto_process = detect_col(
-    cols, [r"水処理方式.*(現有|現況|既存|現在)", r"水処理方式", r"処理方式", r"方式"]
-)
-auto_pop = detect_col(
-    cols, [r"処理人口.*(全体|総).*(計画|予定)", r"(全体|総).*(計画|予定).*(処理人口)", r"処理人口.*計画", r"人口.*計画"]
-)
-auto_cap = detect_col(
-    cols, [r"処理能力.*(㎥|m3|m³).*/?日.*(最大)?.*(現有|現況|既存|現在)", r"処理能力.*最大", r"処理能力"]
-)
+# ========= 列の自動検出＋必須/任意の手動選択 =========
+# 必須3列
+auto_process = detect_col(cols, [r"水処理方式.*(現有|現況|既存|現在)", r"水処理方式", r"処理方式", r"方式"])
+auto_pop     = detect_col(cols, [r"処理人口.*(全体|総).*(計画|予定)", r"(全体|総).*(計画|予定).*(処理人口)", r"処理人口.*計画", r"人口.*計画"])
+auto_cap     = detect_col(cols, [r"処理能力.*(㎥|m3|m³).*/?日.*(最大)?.*(現有|現況|既存|現在)", r"処理能力.*最大", r"処理能力"])
 
-def pick_col_ui(label, auto_guess, options):
-    opts = ["-- 列を選択 --"] + options
-    idx = 0
-    if auto_guess in options:
-        idx = options.index(auto_guess) + 1
-    return st.selectbox(label, options=opts, index=idx)
+# 任意（ホバー用）2列
+auto_pref  = detect_col(cols, [r"都道府県名", r"都道府県", r"[都道府]?[府県]名"])
+auto_plant = detect_col(cols, [r"(処理|下水).*場.*(名|名称)", r"処理場名", r"処理場名称", r"施設名", r"施設名称"])
+
+def pick_col_ui(label, auto_guess, options, optional=False):
+    if optional:
+        opts = ["-- 指定しない --"] + options
+        idx = 0
+        if auto_guess in options:
+            idx = options.index(auto_guess) + 1
+        return st.selectbox(label, options=opts, index=idx)
+    else:
+        opts = ["-- 列を選択 --"] + options
+        idx = 0
+        if auto_guess in options:
+            idx = options.index(auto_guess) + 1
+        return st.selectbox(label, options=opts, index=idx)
 
 st.subheader("列の指定（自動検出の結果を確認して、必要なら変更）")
 c1, c2, c3 = st.columns(3)
 with c1:
-    sel_process = pick_col_ui("水処理方式現有 列", auto_process, cols)
+    sel_process = pick_col_ui("水処理方式現有 列", auto_process, cols, optional=False)
 with c2:
-    sel_pop = pick_col_ui("処理人口（人）全体計画 列", auto_pop, cols)
+    sel_pop = pick_col_ui("処理人口（人）全体計画 列", auto_pop, cols, optional=False)
 with c3:
-    sel_cap = pick_col_ui("処理能力（㎥/日最大）現有 列", auto_cap, cols)
+    sel_cap = pick_col_ui("処理能力（㎥/日最大）現有 列", auto_cap, cols, optional=False)
+
+c4, c5 = st.columns(2)
+with c4:
+    sel_pref = pick_col_ui("都道府県名 列（任意）", auto_pref, cols, optional=True)
+with c5:
+    sel_plant = pick_col_ui("処理場名 列（任意）", auto_plant, cols, optional=True)
 
 missing_labels = []
 if sel_process.startswith("--"): missing_labels.append("水処理方式現有")
@@ -190,9 +200,14 @@ plot_df = filtered_full.rename(
     columns={"_process": "水処理方式現有", "_pop_total": "処理人口（人）全体計画", "_cap_max": "処理能力（㎥/日最大）現有"}
 )[["水処理方式現有", "処理人口（人）全体計画", "処理能力（㎥/日最大）現有"]].copy()
 
-# X/Y にリネーム（既存の "X"/"Y" があっても無視して最小列に限定）
-plot_df = plot_df.rename(columns={x_label: "X", y_label: "Y"})[["水処理方式現有", "X", "Y"]]
+# 任意列（都道府県名・処理場名）を追加
+if (not sel_pref.startswith("--")) and sel_pref in filtered_full.columns:
+    plot_df["都道府県名"] = filtered_full[sel_pref].astype(str)
+if (not sel_plant.startswith("--")) and sel_plant in filtered_full.columns:
+    plot_df["処理場名"] = filtered_full[sel_plant].astype(str)
 
+# X/Y にリネーム（既存の "X"/"Y" があっても無視して最小列に限定）
+plot_df = plot_df.rename(columns={x_label: "X", y_label: "Y"})
 # 列名の重複を排除（保険）
 plot_df = plot_df.loc[:, ~plot_df.columns.duplicated()].copy()
 
@@ -200,7 +215,7 @@ plot_df = plot_df.loc[:, ~plot_df.columns.duplicated()].copy()
 plot_df["X"] = pd.to_numeric(plot_df["X"], errors="coerce")
 plot_df["Y"] = pd.to_numeric(plot_df["Y"], errors="coerce")
 
-# 位置ベースの numpy マスクで絞り込み（reindex 問題を回避）
+# 位置ベースマスクで絞り込み（reindex問題回避）
 m = (
     np.isfinite(plot_df["X"].to_numpy())
     & np.isfinite(plot_df["Y"].to_numpy())
@@ -213,6 +228,13 @@ if plot_df.empty:
     st.warning("有効なデータがありません。列指定や方式の選択を見直してください。")
     st.stop()
 
+# --- ホバー表示項目を動的に構築 ---
+hover_cols = {"水処理方式現有": True, "X": ":,", "Y": ":,"}
+if "都道府県名" in plot_df.columns:
+    hover_cols["都道府県名"] = True
+if "処理場名" in plot_df.columns:
+    hover_cols["処理場名"] = True
+
 # 散布図
 trend_arg = "ols" if trend else None
 fig = px.scatter(
@@ -220,7 +242,7 @@ fig = px.scatter(
     x="X",
     y="Y",
     color="水処理方式現有",
-    hover_data={"水処理方式現有": True, "X": ":,", "Y": ":,"},
+    hover_data=hover_cols,
     trendline=trend_arg,
     trendline_scope="trace",  # 方式ごと
 )
